@@ -9,6 +9,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 pub struct WhisperProvider {
     ctx: WhisperContext,
     n_threads: usize,
+    initial_prompt: String,
 }
 
 impl WhisperProvider {
@@ -29,7 +30,11 @@ impl WhisperProvider {
             .unwrap_or(4)
             .min(8);
 
-        Ok(Self { ctx, n_threads })
+        Ok(Self {
+            ctx,
+            n_threads,
+            initial_prompt: cfg.whisper_initial_prompt.clone(),
+        })
     }
 }
 
@@ -47,6 +52,9 @@ impl TranscriptionProvider for WhisperProvider {
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
+        if !self.initial_prompt.is_empty() {
+            params.set_initial_prompt(&self.initial_prompt);
+        }
 
         state
             .full(params, &audio.samples)

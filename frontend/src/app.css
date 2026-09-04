@@ -100,6 +100,16 @@ button:disabled {
   color: #ffd166;
 }
 
+.transcript {
+  border: 1px solid #2c2c33;
+  border-radius: 8px;
+  padding: 1rem;
+  background: #1e1e24;
+  white-space: pre-wrap;
+  line-height: 1.6;
+  color: #e6e6e6;
+}
+
 .no-errors {
   color: #2ecc71;
 }

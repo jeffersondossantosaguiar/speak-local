@@ -55,7 +55,8 @@ Phase 1: single user, web only, everything runs on your machine.
 
    ```bash
    # https://ollama.com (installs a local daemon on :11434)
-   ollama pull llama3.2        # or qwen2.5:3b if you want something lighter
+   ollama pull llama3.1:8b    # recommended (fine on 16 GB RAM, see Model tuning)
+   # ollama pull llama3.2      # lighter/faster fallback
    ```
 
 3. **Backend env** (optional — defaults already line up with the above):
@@ -138,10 +139,11 @@ See `backend/.env.example`:
 | Var | Default | Purpose |
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:8787` | Backend listen address |
-| `WHISPER_MODEL` | `models/ggml-small.bin` | Whisper model path (relative paths resolve against `backend/`; the repo's `.env` uses `ggml-small.en.bin`) |
+| `WHISPER_MODEL` | `models/ggml-small.en.bin` | Whisper model path (relative paths resolve against `backend/`) |
 | `WHISPER_USE_GPU` | `0` | Run Whisper on the GPU (requires a `--features cuda` build; the repo's `.env` sets `1`) |
+| `WHISPER_INITIAL_PROMPT` | built-in tech-term seed | Seed vocabulary to bias the decoder (helps "NestJS" survive ASR) |
 | `OLLAMA_URL` | `http://localhost:11434` | LLM API base URL |
-| `LLM_MODEL` | `llama3` | Model served by Ollama (`backend/.env` sets `llama3.2`, which you should `ollama pull` first) |
+| `LLM_MODEL` | `llama3.1:8b` | Model served by Ollama (`llama3.1:8b` chosen by benchmark; see **Model tuning**) |
 | `LLM_TEMPERATURE` | `0.1` | Sampling temperature for extraction |
 
 Model trade-offs (all from
@@ -158,6 +160,40 @@ The `.en` variants are tuned for English-only (which is what the backend forces)
 and are faster/more accurate than the multilingual files of the same size. After
 swapping the model file you must **restart the backend** — it's loaded once at
 startup.
+
+## Model tuning
+
+Backed by a measured tuning pass (this machine: Ryzen 5 1600, 16 GB RAM, GTX 1650
+4 GB). Same ~150-word technical pitch (≈500 prompt tokens), analysis step only:
+
+| LLM model (all local via Ollama) | Gen wall (s) | Errors flagged | False-positive style flags |
+| --- | --- | --- | --- |
+| llama3.2 | 84 | 6 | 5 (incl. invented `NestJS→Nest.js`, semicolon "grammar" @5) |
+| qwen2.5:3b | 165 | 5 | 4 (verbose, 1 malformed item) |
+| **llama3.1:8b** | 87 (GPU-auto) | **4** | **3** (all minor @2–3) + best CEFR (B2) |
+| qwen2.5:7b | 136–173 | 6 | 5 |
+
+- **llama3.1:8b is the default**: fewest false positives on acceptable stylistic
+  variation, and it didn't invent a vocabulary error for the tech term `NestJS`.
+  Ollama's automatic partial GPU offload keeps its latency on par with `llama3.2`
+  (~87 s) instead of ~183 s on CPU, without OOM.
+- Real end-to-end (`POST /jobs` on a ~62 s clip): **llama3.2+Whisper GPU 62.5 s**,
+  **llama3.1:8b+Whisper GPU 64.5 s**, **llama3.1:8b+Whisper CPU 60.4 s**. All
+  peaked ≤ ~3.1 GB VRAM with no added swap — so keeping Whisper on the GPU and
+  8b analysis on GPU-auto is the recommended allocation (no inversion needed).
+- Whisper `small.en` on this machine: **~5.9 s GPU** vs **~37 s CPU** per ~62 s of
+  audio. The default `WHISPER_USE_GPU=1` is much faster for real recordings.
+- `whisper.cpp` exposes vocab bias via `WHISPER_INITIAL_PROMPT`. It can fix
+  mis-heard tech terms that are in the seed (e.g. "NestJS"), but it cannot recover
+  a term transcriber mishears as a different known word. For real accuracy on
+  proper nouns, re-record or correct the transcript.
+
+The analysis prompt (`ollama.rs`) is tuned to report only real grammar/vocabulary
+errors, to treat likely transcription artifacts (odd tech terms) cautiously, and
+to prefer an empty `errors` list for correct English. A small post-filter also
+strips measured false positives ("consisted", "a lot", "instead of", "every day",
+"with Docker", … as vocabulary/awkward nits) while always passing grammar defects
+through, and caps "awkward" criticality at 2.
 
 ## Notes / conventions
 

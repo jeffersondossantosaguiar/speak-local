@@ -12,6 +12,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [statusText, setStatusText] = useState<string>("");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [transcript, setTranscript] = useState<string>("");
 
   const handleStop = async () => {
     const blob = await recorder.stop();
@@ -23,6 +24,7 @@ export default function App() {
     setPhase("analyzing");
     setError(null);
     setAnalysis(null);
+    setTranscript("");
     try {
       const jobId = await submitAudio(blob);
       setStatusText("job submitted, waiting for transcription…");
@@ -34,7 +36,7 @@ export default function App() {
         (final) => {
           if (final.status === "completed") {
             const { transcript, analysis: a } = final.result;
-            void transcript;
+            setTranscript(transcript.text);
             setAnalysis(a);
           } else {
             setError(final.error);
@@ -72,6 +74,13 @@ export default function App() {
 
       {phase === "analyzing" && <p className="status">{statusText}</p>}
       {error && <p className="error">{error}</p>}
+
+      {transcript && (
+        <section className="results">
+          <h2>Your transcript</h2>
+          <p className="transcript">“{transcript}”</p>
+        </section>
+      )}
 
       {analysis && <AnalysisView analysis={analysis} />}
     </main>
