@@ -1,3 +1,4 @@
+use crate::analysis_hub::AnalysisHub;
 use crate::audio::decode_audio;
 use crate::config::Config;
 use crate::error::AppError;
@@ -18,6 +19,10 @@ pub enum JobStatus {
     Pending,
     #[serde(rename = "processing")]
     Processing,
+    /// Whisper has finished; the transcript is available even though the LLM
+    /// analysis is still streaming. Lets the UI show the text right away.
+    #[serde(rename = "transcribed")]
+    Transcribed { transcript: Transcript },
     #[serde(rename = "completed")]
     Completed { result: JobResult },
     #[serde(rename = "failed")]
@@ -47,6 +52,8 @@ pub struct JobStore {
     analysis: Arc<dyn AnalysisProvider>,
     /// Shared lock that serializes whisper model access across all callers.
     whisper_gate: WhisperGate,
+    /// Broadcasts the streaming LLM analysis to SSE subscribers per job.
+    hub: Arc<AnalysisHub>,
     /// Keep-alive duration for finished jobs before they are swept.
     retention: Duration,
 }
@@ -73,11 +80,29 @@ impl JobStore {
         _cfg: &Config,
         whisper_gate: WhisperGate,
     ) -> Self {
+        Self::with_hub_and_gate(
+            transcription,
+            analysis,
+            _cfg,
+            whisper_gate,
+            Arc::new(AnalysisHub::new()),
+        )
+    }
+
+    /// Full control: shared whisper gate + externally-visible analysis hub.
+    pub fn with_hub_and_gate(
+        transcription: Arc<dyn TranscriptionProvider>,
+        analysis: Arc<dyn AnalysisProvider>,
+        _cfg: &Config,
+        whisper_gate: WhisperGate,
+        hub: Arc<AnalysisHub>,
+    ) -> Self {
         Self {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             transcription,
             analysis,
             whisper_gate,
+            hub,
             retention: Duration::from_secs(10 * 60),
         }
     }
@@ -92,36 +117,30 @@ impl JobStore {
         let transcription = self.transcription.clone();
         let analysis = self.analysis.clone();
         let gate = self.whisper_gate.clone();
-        let state = status.clone();
+        let hub = self.hub.clone();
 
         tokio::spawn(async move {
-            *state.lock().unwrap() = JobStatus::Processing;
             let decoded = tokio::task::spawn_blocking(move || decode_audio(&audio_bytes))
                 .await
                 .map_err(|e| AppError::Internal(format!("decode task panicked: {e}")));
-
-            let outcome = match decoded {
-                Ok(Ok(samples)) => run_pipeline(samples, transcription, analysis, gate).await,
-                Ok(Err(e)) => Err(AppError::Audio(e)),
-                Err(e) => Err(e),
-            };
-
-            let next = match outcome {
-                Ok((transcript, analysis)) => JobStatus::Completed {
-                    result: JobResult { transcript, analysis },
-                },
-                Err(e) => JobStatus::Failed {
+            match decoded {
+                Ok(Ok(samples)) => {
+                    run_job(id, status, samples, transcription, analysis, gate, hub).await
+                }
+                Ok(Err(e)) => *status.lock().unwrap() = JobStatus::Failed {
                     error: e.to_string(),
                 },
-            };
-            *status.lock().unwrap() = next;
+                Err(e) => *status.lock().unwrap() = JobStatus::Failed {
+                    error: e.to_string(),
+                },
+            }
         });
 
         id
     }
 
     /// Register a new job from already-decoded samples (streaming finalize
-    /// path). Same pipeline, same whisper gate.
+    /// path). Same pipeline, same whisper gate, same analysis hub.
     pub fn submit_from_samples(&self, samples: AudioSamples) -> Uuid {
         let id = Uuid::new_v4();
         let status = self.new_pending(id);
@@ -129,21 +148,10 @@ impl JobStore {
         let transcription = self.transcription.clone();
         let analysis = self.analysis.clone();
         let gate = self.whisper_gate.clone();
-        let state = status.clone();
+        let hub = self.hub.clone();
 
         tokio::spawn(async move {
-            *state.lock().unwrap() = JobStatus::Processing;
-            let outcome = run_pipeline(samples, transcription, analysis, gate).await;
-
-            let next = match outcome {
-                Ok((transcript, analysis)) => JobStatus::Completed {
-                    result: JobResult { transcript, analysis },
-                },
-                Err(e) => JobStatus::Failed {
-                    error: e.to_string(),
-                },
-            };
-            *status.lock().unwrap() = next;
+            run_job(id, status, samples, transcription, analysis, gate, hub).await
         });
 
         id
@@ -186,25 +194,65 @@ impl JobStore {
     }
 }
 
-/// Transcribe → analyze. The whisper gate is held only across the model call;
-/// the LLM analysis runs without it so streaming partials of other sessions are
-/// not blocked while one job's language model completes.
-async fn run_pipeline(
+/// Transcribe → publish the transcript → stream the LLM analysis. The whisper
+/// gate is held only across the model call; the LLM analysis runs without it so
+/// streaming partials of other sessions are not blocked while one job's
+/// language model completes. The `Transcribed` intermediate state lets the UI
+/// show the transcript as soon as Whisper finishes, while error boxes arrive
+/// over the analysis SSE stream.
+#[allow(clippy::too_many_arguments)]
+async fn run_job(
+    id: Uuid,
+    state: Arc<Mutex<JobStatus>>,
     samples: AudioSamples,
     transcription: Arc<dyn TranscriptionProvider>,
     analysis: Arc<dyn AnalysisProvider>,
     gate: WhisperGate,
-) -> Result<(Transcript, Analysis), AppError> {
-    let whisper_guard = gate.lock().await;
-    let transcript = tokio::task::spawn_blocking(move || transcription.transcribe(&samples))
-        .await
-        .map_err(|e| AppError::Internal(format!("transcribe task panicked: {e}")))??;
-    drop(whisper_guard);
+    hub: Arc<AnalysisHub>,
+) {
+    let set = |s: JobStatus| *state.lock().unwrap() = s;
+    set(JobStatus::Processing);
+
+    let transcript = {
+        let _g = gate.lock().await;
+        tokio::task::spawn_blocking(move || transcription.transcribe(&samples))
+            .await
+            .map_err(|e| AppError::Internal(format!("transcribe task panicked: {e}")))
+            .and_then(|r| r)
+    };
+    let transcript = match transcript {
+        Ok(t) => t,
+        Err(e) => {
+            set(JobStatus::Failed {
+                error: e.to_string(),
+            });
+            return;
+        }
+    };
+    set(JobStatus::Transcribed {
+        transcript: transcript.clone(),
+    });
 
     let text = transcript.text.clone();
-    let analysis = tokio::task::spawn_blocking(move || analysis.analyze(&text))
-        .await
-        .map_err(|e| AppError::Internal(format!("analysis task panicked: {e}")))??;
+    let hub2 = hub.clone();
+    let analysis = tokio::task::spawn_blocking(move || {
+        analysis.analyze_streaming(&text, &mut |delta: &str| {
+            hub2.push_delta(id, delta);
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("analysis task panicked: {e}")))
+    .and_then(|r| r);
 
-    Ok((transcript, analysis))
+    match analysis {
+        Ok(a) => {
+            hub.push_done(id, a.clone());
+            set(JobStatus::Completed {
+                result: JobResult { transcript, analysis: a },
+            });
+        }
+        Err(e) => set(JobStatus::Failed {
+            error: e.to_string(),
+        }),
+    }
 }

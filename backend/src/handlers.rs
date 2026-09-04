@@ -1,12 +1,18 @@
-use crate::jobs::JobStore;
+use crate::analysis_extract::ErrorObjectExtractor;
+use crate::analysis_hub::{AnalysisHub, HubEvent};
+use crate::jobs::{JobStatus, JobStore};
+use crate::providers::ollama::error_item_from_json_string;
 use crate::streams::{StreamStore, StreamView};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Response;
 use axum::Json;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -15,6 +21,7 @@ use uuid::Uuid;
 pub struct AppState {
     pub jobs: Arc<JobStore>,
     pub streams: Arc<StreamStore>,
+    pub hub: Arc<AnalysisHub>,
 }
 
 /// POST /jobs — accept an audio upload and start an analysis job.
@@ -117,16 +124,116 @@ pub async fn get_stream(
 }
 
 /// POST /streams/{id} — stop recording and run the full pipeline. Returns
-/// { "status": "finalized" }; poll GET /streams/{id} for the result.
+/// { "status": "finalized", "job_id": "..." }; poll GET /streams/{id} for the
+/// transcript/intermediate state and open GET /jobs/{job_id}/analysis/stream
+/// for the streaming LLM errors.
 pub async fn finalize_stream(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> (StatusCode, Json<Value>) {
     match state.streams.finalize(id) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "status": "finalized" }))),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e })),
+        Ok(job) => (
+            StatusCode::OK,
+            Json(json!({ "status": "finalized", "job_id": job.to_string() })),
         ),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
     }
+}
+
+/// GET /jobs/{id}/analysis/stream — SSE that replays the analysis generated so
+/// far and then streams the LLM output, emitting one event per completed error
+/// object and a final `done` with the full validated `Analysis`.
+///
+/// Events (`data:` lines): `{ "type": "error", "error": { ... } }` and
+/// `{ "type": "done", "analysis": { ... } }`.
+pub async fn analysis_stream(
+    State(state): State<AppState>,
+    Path(job): Path<Uuid>,
+) -> Response {
+    let Some(status) = state.jobs.get(job) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "job not found" })),
+        )
+            .into_response();
+    };
+
+    let hub = state.hub.clone();
+    let jobs = state.jobs.clone();
+
+    let stream = async_stream::stream! {
+        let mut extractor = ErrorObjectExtractor::default();
+
+        macro_rules! emit_errors {
+            ($slices:expr) => {
+                for s in $slices {
+                    if let Some(item) = error_item_from_json_string(s) {
+                        let data = serde_json::to_string(&json!({ "type": "error", "error": item }))
+                            .unwrap_or_default();
+                        yield Ok::<_, Infallible>(Event::default().data(data));
+                    }
+                }
+            };
+        }
+
+        match &status {
+            JobStatus::Completed { result } => {
+                let data = serde_json::to_string(&json!({ "type": "done", "analysis": result.analysis }))
+                    .unwrap_or_default();
+                yield Ok::<_, Infallible>(Event::default().data(data));
+                return;
+            }
+            JobStatus::Failed { .. } => return,
+            _ => {}
+        }
+
+        let sub = hub.subscribe(job);
+
+        // Replay anything produced before this connection attached, so a late
+        // subscriber still sees every box without waiting for new tokens.
+        for delta in sub.past_deltas {
+            let mut slices = Vec::new();
+            extractor.feed(&delta, &mut |slice| slices.push(slice.to_string()));
+            emit_errors!(&slices);
+        }
+
+        // If the job settled between subscription and now (e.g. done was
+        // broadcast before we attached), serve the settled result directly.
+        // A job that failed analysis never broadcasts, so close the stream
+        // too rather than hanging; the client falls back to polling.
+        match jobs.get(job) {
+            Some(JobStatus::Completed { result }) => {
+                let data =
+                    serde_json::to_string(&json!({ "type": "done", "analysis": result.analysis }))
+                        .unwrap_or_default();
+                yield Ok::<_, Infallible>(Event::default().data(data));
+                return;
+            }
+            Some(JobStatus::Failed { .. }) => return,
+            _ => {}
+        }
+
+        let mut rx = sub.rx;
+        loop {
+            match rx.recv().await {
+                Ok(HubEvent::Delta(delta)) => {
+                    let mut slices = Vec::new();
+                    extractor.feed(&delta, &mut |slice| slices.push(slice.to_string()));
+                    emit_errors!(&slices);
+                }
+                Ok(HubEvent::Done(analysis)) => {
+                    let data =
+                        serde_json::to_string(&json!({ "type": "done", "analysis": analysis }))
+                            .unwrap_or_default();
+                    yield Ok::<_, Infallible>(Event::default().data(data));
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+    };
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }

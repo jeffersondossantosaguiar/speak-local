@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// this keeps the trait interface synchronous while the async runtime stays
 /// responsive.
 pub struct OllamaProvider {
-    url: String,
+    base_url: String,
     model: String,
     temperature: f32,
     client: reqwest::blocking::Client,
@@ -33,6 +33,18 @@ struct Choice {
 #[derive(Deserialize)]
 struct Message {
     content: String,
+}
+
+/// One NDJSON line of a native `/api/chat` streaming response.
+#[derive(Deserialize)]
+struct OllamaStreamChunk {
+    message: Option<OllamaStreamMessage>,
+    done: bool,
+}
+
+#[derive(Deserialize)]
+struct OllamaStreamMessage {
+    content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -115,7 +127,7 @@ Respond with ONLY a single JSON object, no prose, no markdown code fences. Schem
 impl OllamaProvider {
     pub fn new(cfg: &Config) -> Self {
         Self {
-            url: format!("{}/v1/chat/completions", cfg.ollama_url.trim_end_matches('/')),
+            base_url: cfg.ollama_url.trim_end_matches('/').to_string(),
             model: cfg.llm_model.clone(),
             temperature: cfg.llm_temperature,
             // reqwest's blocking client defaults to a 30 s total timeout, but a
@@ -128,10 +140,21 @@ impl OllamaProvider {
         }
     }
 
-    fn build_request(&self, transcript: &str) -> ChatRequest<'_> {
-        let user_content = format!(
+    fn chat_url(&self) -> String {
+        format!("{}/v1/chat/completions", self.base_url)
+    }
+
+    fn stream_url(&self) -> String {
+        format!("{}/api/chat", self.base_url)
+    }
+
+    fn user_prompt(transcript: &str) -> String {
+        format!(
             "Here is the transcript of what I spoke to practice English:\n\n\"\"\"\n{transcript}\n\"\"\"\n\nAnalyze it as instructed and return the JSON object."
-        );
+        )
+    }
+
+    fn build_request(&self, transcript: &str) -> ChatRequest<'_> {
         ChatRequest {
             model: &self.model,
             temperature: self.temperature,
@@ -143,7 +166,7 @@ impl OllamaProvider {
                 },
                 ChatMessage {
                     role: "user",
-                    content: user_content,
+                    content: Self::user_prompt(transcript),
                 },
             ],
             response_format: ResponseFormat {
@@ -168,12 +191,7 @@ impl OllamaProvider {
         let mut last_err: Option<AppError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             let req = self.build_request(transcript);
-            match self
-                .client
-                .post(&self.url)
-                .json(&req)
-                .send()
-            {
+            match self.client.post(self.chat_url()).json(&req).send() {
                 Ok(resp) => return self.handle_response(resp),
                 Err(e) => {
                     last_err = Some(AppError::Analysis(format!("llm request failed: {e}")));
@@ -214,11 +232,112 @@ impl OllamaProvider {
 
         parse_analysis(&content)
     }
+
+    /// Stream the model output over Ollama's native `/api/chat` endpoint and
+    /// report each content chunk via `on_delta`, rebuilding the full JSON at
+    /// the end for the authoritative result. Same retry philosophy as
+    /// [`Self::call_sync`].
+    fn stream_sync(
+        &self,
+        transcript: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Analysis, AppError> {
+        const MAX_ATTEMPTS: u32 = 3;
+        const WARMUP_MS: u64 = 1500;
+
+        let mut last_err: Option<AppError> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let body = serde_json::json!({
+                "model": self.model,
+                "stream": true,
+                "format": "json",
+                "options": { "temperature": self.temperature },
+                "messages": [
+                    { "role": "system", "content": SYSTEM_PROMPT },
+                    { "role": "user", "content": Self::user_prompt(transcript) },
+                ],
+            });
+            match self.client.post(self.stream_url()).json(&body).send() {
+                Ok(resp) => {
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let body = resp.text().unwrap_or_default();
+                        return Err(AppError::Analysis(format!(
+                            "llm returned {status}: {body}"
+                        )));
+                    }
+                    return self.read_stream(resp, on_delta);
+                }
+                Err(e) => {
+                    last_err = Some(AppError::Analysis(format!("llm stream request failed: {e}")));
+                    let retryable = e.is_connect() || e.is_request();
+                    if attempt + 1 < MAX_ATTEMPTS && retryable {
+                        std::thread::sleep(std::time::Duration::from_millis(WARMUP_MS));
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| AppError::Analysis("llm stream request failed".into())))
+    }
+
+    fn read_stream(
+        &self,
+        resp: reqwest::blocking::Response,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<Analysis, AppError> {
+        use std::io::BufRead;
+
+        let mut content = String::new();
+        let mut reader = std::io::BufReader::new(resp);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).map_err(|e| {
+                AppError::Analysis(format!("reading llm stream failed: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Older Ollama versions end the stream with a bare "done" line.
+            if trimmed == "done" {
+                break;
+            }
+            let chunk: OllamaStreamChunk = match serde_json::from_str(trimmed) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if let Some(text) = chunk.message.as_ref().and_then(|m| m.content.as_deref()) {
+                if !text.is_empty() {
+                    content.push_str(text);
+                    on_delta(text);
+                }
+            }
+            if chunk.done {
+                break;
+            }
+        }
+        parse_analysis(&content)
+    }
 }
 
 impl AnalysisProvider for OllamaProvider {
     fn analyze(&self, transcript: &str) -> AnalysisResult {
         self.call_sync(transcript)
+    }
+
+    fn analyze_streaming(
+        &self,
+        transcript: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> AnalysisResult {
+        self.stream_sync(transcript, on_delta)
     }
 }
 
@@ -279,22 +398,7 @@ fn parse_analysis(content: &str) -> Result<Analysis, AppError> {
     let json: AnalysisJson = serde_json::from_str(&cleaned)
         .map_err(|e| AppError::Analysis(format!("llm output was not valid JSON: {e}")))?;
 
-    let mut errors: Vec<ErrorItem> = json
-        .errors
-        .into_iter()
-        .map(|e| ErrorItem {
-            text: e.text.trim().to_string(),
-            suggestion: e.suggestion.trim().to_string(),
-            category: if e.category.is_empty() {
-                "other".to_string()
-            } else {
-                e.category
-            },
-            criticality: e.criticality,
-            context: e.context.trim().to_string(),
-            explanation: e.explanation.trim().to_string(),
-        })
-        .collect();
+    let mut errors: Vec<ErrorItem> = json.errors.into_iter().map(map_error_json).collect();
 
     errors = filter_style_false_positives(errors);
 
@@ -314,6 +418,31 @@ fn parse_analysis(content: &str) -> Result<Analysis, AppError> {
         cefr_justification: json.cefr_justification.trim().to_string(),
         errors,
     })
+}
+
+fn map_error_json(e: ErrorJson) -> ErrorItem {
+    ErrorItem {
+        text: e.text.trim().to_string(),
+        suggestion: e.suggestion.trim().to_string(),
+        category: if e.category.is_empty() {
+            "other".to_string()
+        } else {
+            e.category
+        },
+        criticality: e.criticality,
+        context: e.context.trim().to_string(),
+        explanation: e.explanation.trim().to_string(),
+    }
+}
+
+/// Parse a single streaming JSON object and normalize it into a frontend-ready
+/// `ErrorItem` (applying the same denylist + awkward cap as the final parse so
+/// a box shown live never contradicts the settled result). Returns `None` when
+/// the slice is not a valid error object (e.g. the enclosing document).
+pub(crate) fn error_item_from_json_string(slice: &str) -> Option<ErrorItem> {
+    let e: ErrorJson = serde_json::from_str(slice).ok()?;
+    let item = map_error_json(e);
+    filter_style_false_positives(vec![item]).pop()
 }
 
 /// Remove leading/trailing ``` markers and any leading prose line so that the

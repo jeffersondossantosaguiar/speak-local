@@ -55,4 +55,17 @@ pub struct Analysis {
 /// a cloud LLM (Claude API, OpenAI, etc.) can replace the local Ollama impl.
 pub trait AnalysisProvider: Send + Sync {
     fn analyze(&self, transcript: &str) -> AnalysisResult;
+
+    /// Same as [`Self::analyze`] but reports chunks of the model output to
+    /// `on_delta` as they are generated, so the UI can render error boxes
+    /// incrementally. The default implementation ignores the callback and
+    /// behaves exactly like [`Self::analyze`].
+    fn analyze_streaming(
+        &self,
+        transcript: &str,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> AnalysisResult {
+        let _ = on_delta;
+        self.analyze(transcript)
+    }
 }

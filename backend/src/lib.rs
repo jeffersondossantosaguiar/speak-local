@@ -1,3 +1,5 @@
+pub mod analysis_extract;
+pub mod analysis_hub;
 pub mod audio;
 pub mod config;
 pub mod error;

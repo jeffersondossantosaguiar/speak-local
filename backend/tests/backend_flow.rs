@@ -107,7 +107,12 @@ async fn full_pipeline_reaches_completed() {
     let mut final_status = None;
     for _ in 0..50 {
         let status = store.get(id).unwrap();
-        if !matches!(status, speak_local_backend::jobs::JobStatus::Processing | speak_local_backend::jobs::JobStatus::Pending) {
+        if !matches!(
+            status,
+            speak_local_backend::jobs::JobStatus::Processing
+                | speak_local_backend::jobs::JobStatus::Pending
+                | speak_local_backend::jobs::JobStatus::Transcribed { .. }
+        ) {
             final_status = Some(status);
             break;
         }
@@ -139,12 +144,14 @@ async fn missing_job_returns_not_found() {
 }
 
 fn stream_store(cfg: &Config) -> StreamStore {
-    StreamStore::new(
+    let gate = Arc::new(AsyncMutex::new(()));
+    let jobs = JobStore::with_gate(
         Arc::new(StubTranscriber),
         Arc::new(StubAnalyzer),
-        Arc::new(AsyncMutex::new(())),
         cfg,
-    )
+        gate.clone(),
+    );
+    StreamStore::new(Arc::new(StubTranscriber), Arc::new(jobs), gate, cfg)
 }
 
 #[tokio::test]
@@ -167,9 +174,10 @@ async fn stream_reaches_completed_after_finalize() {
     for _ in 0..50 {
         match store.get(id).unwrap() {
             StreamView::Finished(status) => {
-                if !matches!(
+                if matches!(
                     status,
-                    speak_local_backend::jobs::JobStatus::Processing
+                    speak_local_backend::jobs::JobStatus::Completed { .. }
+                        | speak_local_backend::jobs::JobStatus::Failed { .. }
                 ) {
                     final_status = Some(status);
                     break;
@@ -255,10 +263,17 @@ impl TranscriptionProvider for FailingTranscriber {
 #[tokio::test]
 async fn stream_failure_reaches_failed_not_stuck_processing() {
     let cfg = Config::from_env().unwrap();
-    let store = StreamStore::new(
+    let gate = Arc::new(AsyncMutex::new(()));
+    let jobs = JobStore::with_gate(
         Arc::new(FailingTranscriber),
         Arc::new(StubAnalyzer),
-        Arc::new(AsyncMutex::new(())),
+        &cfg,
+        gate.clone(),
+    );
+    let store = StreamStore::new(
+        Arc::new(FailingTranscriber),
+        Arc::new(jobs),
+        gate,
         &cfg,
     );
 
@@ -270,7 +285,11 @@ async fn stream_failure_reaches_failed_not_stuck_processing() {
     for _ in 0..50 {
         match store.get(id).unwrap() {
             StreamView::Finished(status) => {
-                if !matches!(status, speak_local_backend::jobs::JobStatus::Processing) {
+                if matches!(
+                    status,
+                    speak_local_backend::jobs::JobStatus::Completed { .. }
+                        | speak_local_backend::jobs::JobStatus::Failed { .. }
+                ) {
                     final_status = Some(status);
                     break;
                 }

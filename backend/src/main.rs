@@ -1,10 +1,12 @@
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
+use speak_local_backend::analysis_hub::AnalysisHub;
 use speak_local_backend::config::Config;
 use std::path::Path;
 use speak_local_backend::handlers::{
-    create_stream, finalize_stream, get_job, get_stream, health, stream_ws, submit_job, AppState,
+    analysis_stream, create_stream, finalize_stream, get_job, get_stream, health, stream_ws,
+    submit_job, AppState,
 };
 use speak_local_backend::jobs::{JobStore, WhisperGate};
 use speak_local_backend::providers::ollama::OllamaProvider;
@@ -57,21 +59,24 @@ async fn run_server(
     // One whisper gate serializes ALL model access: whole-record jobs and
     // streaming partial/final passes share a single non-thread-safe context.
     let whisper_gate: WhisperGate = Arc::new(Mutex::new(()));
-    let job_store = Arc::new(JobStore::with_gate(
+    let hub = Arc::new(AnalysisHub::new());
+    let job_store = Arc::new(JobStore::with_hub_and_gate(
         transcription.clone(),
         analysis.clone(),
         &cfg,
         whisper_gate.clone(),
+        hub.clone(),
     ));
     let stream_store = Arc::new(StreamStore::new(
         transcription,
-        analysis,
+        job_store.clone(),
         whisper_gate,
         &cfg,
     ));
     let state = AppState {
         jobs: job_store.clone(),
         streams: stream_store.clone(),
+        hub,
     };
 
     // Periodically sweep finished jobs and stream sessions so the in-memory
@@ -79,12 +84,16 @@ async fn run_server(
     {
         let store = job_store.clone();
         let streams = stream_store.clone();
+        let analysis_hub = state.hub.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let now = std::time::SystemTime::now();
                 store.sweep(now);
                 streams.sweep(now);
+                // Analysis buffers trail their jobs; expire them on the same
+                // cadence (10 min) so abandoned SSE channels cannot leak.
+                analysis_hub.sweep(now, Duration::from_secs(10 * 60));
             }
         });
     }
@@ -99,6 +108,7 @@ async fn run_server(
             post(submit_job).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
         )
         .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/analysis/stream", get(analysis_stream))
         .route("/streams", post(create_stream))
         .route("/streams/{id}", get(get_stream).post(finalize_stream))
         .route("/streams/{id}/ws", get(stream_ws))

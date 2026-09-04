@@ -1,7 +1,7 @@
 use crate::audio::decode_audio;
 use crate::config::Config;
-use crate::jobs::{JobResult, JobStatus, WhisperGate};
-use crate::providers::{AnalysisProvider, AudioSamples, TranscriptionProvider};
+use crate::jobs::{JobStatus, JobStore, WhisperGate};
+use crate::providers::{AudioSamples, TranscriptionProvider};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -12,8 +12,8 @@ use uuid::Uuid;
 pub enum StreamView {
     /// Still recording: expose the refining partial draft.
     Active { partial_text: String, audio_seconds: usize },
-    /// Finalized: a full job status (processing while the model runs, then
-    /// completed/failed).
+    /// Finalized: the delegated job's status (transcribed while whisper
+    /// finished and the LLM streams, then completed/failed).
     Finished(JobStatus),
 }
 
@@ -25,8 +25,10 @@ struct StreamData {
     partial_running: bool,
     partial_text: Option<String>,
     finalized: bool,
-    final_running: bool,
-    final_status: Option<JobStatus>,
+    /// The job that owns the final pipeline, created by [`StreamStore::finalize`].
+    final_job_id: Option<Uuid>,
+    /// Set when finalize is rejected (e.g. the recording is too long).
+    final_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -39,8 +41,10 @@ struct StreamEntry {
 pub struct StreamStore {
     streams: Arc<Mutex<HashMap<Uuid, StreamEntry>>>,
     transcription: Arc<dyn TranscriptionProvider>,
-    analysis: Arc<dyn AnalysisProvider>,
     whisper_gate: WhisperGate,
+    /// The final pipeline (whisper + streaming LLM) runs as a job here so it
+    /// shares the same analysis hub and intermediate states as uploads.
+    jobs: Arc<JobStore>,
     retention: Duration,
     max_samples: usize,
     partial_interval_samples: usize,
@@ -50,15 +54,15 @@ pub struct StreamStore {
 impl StreamStore {
     pub fn new(
         transcription: Arc<dyn TranscriptionProvider>,
-        analysis: Arc<dyn AnalysisProvider>,
+        jobs: Arc<JobStore>,
         whisper_gate: WhisperGate,
         cfg: &Config,
     ) -> Self {
         Self {
             streams: Arc::new(Mutex::new(HashMap::new())),
             transcription,
-            analysis,
             whisper_gate,
+            jobs,
             retention: Duration::from_secs(cfg.stream_retention_secs),
             max_samples: cfg.stream_max_secs * 16_000,
             partial_interval_samples: cfg.stream_partial_interval_secs * 16_000,
@@ -78,8 +82,8 @@ impl StreamStore {
                     partial_running: false,
                     partial_text: None,
                     finalized: false,
-                    final_running: false,
-                    final_status: None,
+                    final_job_id: None,
+                    final_error: None,
                 }),
                 created_at: SystemTime::now(),
             },
@@ -165,106 +169,52 @@ impl StreamStore {
         text_result.map(|_| ())
     }
 
-    /// Stop accepting audio and run the full Whisper + LLM pipeline. Idempotent:
-    /// calling twice returns early once the final status is stored.
-    pub fn finalize(&self, id: Uuid) -> Result<(), String> {
-        {
-            let streams = self.streams.lock().unwrap();
-            let entry = streams.get(&id).ok_or("stream not found")?;
-            let mut d = entry.data.lock().unwrap();
-            if d.finalized {
-                return Ok(());
-            }
-            if d.final_status.is_some() {
-                return Ok(());
-            }
-            if d.samples.is_empty() {
-                return Err("stream has no audio".into());
-            }
-            if d.samples.len() > self.max_samples {
-                d.finalized = true;
-                d.final_status = Some(JobStatus::Failed {
-                    error: format!("recording exceeds {} seconds", self.max_samples / 16_000),
-                });
-                return Ok(());
-            }
-            d.finalized = true;
-            d.final_running = true;
-        }
-        let this = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = this.run_final(id).await {
-                tracing::warn!(%id, %e, "final pipeline failed");
-            }
-        });
-        Ok(())
-    }
-
-    async fn run_final(&self, id: Uuid) -> Result<(), String> {
-        let outcome = self.final_status(id).await;
+    /// Stop accepting audio and hand the full buffer to the job store, which
+    /// runs the Whisper + streaming LLM pipeline and keys the analysis SSE hub
+    /// by the returned job id. Idempotent: a second call returns the same id.
+    pub fn finalize(&self, id: Uuid) -> Result<Uuid, String> {
         let mut streams = self.streams.lock().unwrap();
-        if let Some(entry) = streams.get_mut(&id) {
-            let mut d = entry.data.lock().unwrap();
-            d.final_running = false;
-            match &outcome {
-                Ok(status) => d.final_status = Some(status.clone()),
-                Err(e) => {
-                    d.final_status = Some(JobStatus::Failed {
-                        error: e.clone(),
-                    })
-                }
-            }
+        let entry = streams.get_mut(&id).ok_or("stream not found")?;
+        let d = entry.data.get_mut().unwrap();
+
+        if let Some(job) = d.final_job_id {
+            return Ok(job);
         }
-        outcome.map(|_| ())
-    }
+        if let Some(err) = &d.final_error {
+            return Err(err.clone());
+        }
+        if d.samples.is_empty() {
+            return Err("stream has no audio".into());
+        }
+        if d.samples.len() > self.max_samples {
+            let msg = format!("recording exceeds {} seconds", self.max_samples / 16_000);
+            d.finalized = true;
+            d.final_error = Some(msg.clone());
+            return Err(msg);
+        }
 
-    async fn final_status(&self, id: Uuid) -> Result<JobStatus, String> {
-        // Transcribe under the whisper gate (like every other model call).
-        let transcript = {
-            let samples = {
-                let streams = self.streams.lock().unwrap();
-                let entry = match streams.get(&id) {
-                    Some(e) => e,
-                    None => return Err("stream not found".into()),
-                };
-                let data = entry.data.lock().unwrap();
-                let out = data.samples.clone();
-                drop(data);
-                out
-            };
-            let _g = self.whisper_gate.lock().await;
-            let transcriber = self.transcription.clone();
-            tokio::task::spawn_blocking(move || transcriber.transcribe(&AudioSamples { samples }))
-                .await
-                .map_err(|e| format!("transcribe task panicked: {e}"))?
-                .map_err(|e| e.to_string())?
-        };
-
-        // The LLM runs without the whisper gate (see jobs::run_pipeline).
-        let analysis = {
-            let text = transcript.text.clone();
-            let analyzer = self.analysis.clone();
-            tokio::task::spawn_blocking(move || analyzer.analyze(&text))
-                .await
-                .map_err(|e| format!("analysis task panicked: {e}"))?
-                .map_err(|e| e.to_string())?
-        };
-
-        Ok(JobStatus::Completed {
-            result: JobResult { transcript, analysis },
-        })
+        let samples = std::mem::take(&mut d.samples);
+        d.finalized = true;
+        let job = self.jobs.submit_from_samples(AudioSamples { samples });
+        d.final_job_id = Some(job);
+        Ok(job)
     }
 
     pub fn get(&self, id: Uuid) -> Option<StreamView> {
         let streams = self.streams.lock().unwrap();
         let entry = streams.get(&id)?;
         let d = entry.data.lock().unwrap();
-        if let Some(status) = d.final_status.clone() {
-            return Some(StreamView::Finished(status));
+        if let Some(err) = &d.final_error {
+            return Some(StreamView::Finished(JobStatus::Failed {
+                error: err.clone(),
+            }));
         }
         if d.finalized {
-            // Final pipeline still in flight.
-            return Some(StreamView::Finished(JobStatus::Processing));
+            // The final pipeline runs as a job; report its live status.
+            return match d.final_job_id.and_then(|jid| self.jobs.get(jid)) {
+                Some(status) => Some(StreamView::Finished(status)),
+                None => Some(StreamView::Finished(JobStatus::Processing)),
+            };
         }
         Some(StreamView::Active {
             partial_text: d.partial_text.clone().unwrap_or_default(),

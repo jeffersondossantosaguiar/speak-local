@@ -25,6 +25,7 @@ export interface JobResult {
 export type JobStatus =
   | { status: "pending" }
   | { status: "processing" }
+  | { status: "transcribed"; transcript: Transcript }
   | { status: "completed"; result: JobResult }
   | { status: "failed"; error: string };
 
@@ -45,3 +46,17 @@ export interface StreamActive {
 
 /** Everything GET /streams/{id} can return while recording or after finalize. */
 export type StreamStatus = StreamActive | JobStatus;
+
+/** SSE frame from GET /jobs/{id}/analysis/stream: one error box completes. */
+export interface AnalysisErrorEvent {
+  type: "error";
+  error: ErrorItem;
+}
+
+/** SSE frame announcing the final, validated analysis. */
+export interface AnalysisDoneEvent {
+  type: "done";
+  analysis: Analysis;
+}
+
+export type AnalysisEvent = AnalysisErrorEvent | AnalysisDoneEvent;
