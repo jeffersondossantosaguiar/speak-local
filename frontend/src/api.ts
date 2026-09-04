@@ -31,3 +31,17 @@ export type JobStatus =
 export interface SubmitResponse {
   job_id: string;
 }
+
+export interface CreateStreamResponse {
+  stream_id: string;
+}
+
+/** Poll response for an in-progress (recording) streaming session. */
+export interface StreamActive {
+  status: "active";
+  partial_text: string;
+  audio_seconds: number;
+}
+
+/** Everything GET /streams/{id} can return while recording or after finalize. */
+export type StreamStatus = StreamActive | JobStatus;

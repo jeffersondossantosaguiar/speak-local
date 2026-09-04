@@ -132,6 +132,30 @@ pnpm dev
    - `analysis.errors[]` — each with `text`, `suggestion`, `category`,
      `criticality` (ordered most-critical first), `context`, `explanation`.
 
+### Streaming (live transcript while recording)
+
+The UI can also transcribe **while** you speak instead of only after stopping:
+
+1. `POST /streams` creates a session → `{ "stream_id": "..." }`.
+2. The frontend opens `GET /streams/{id}/ws` (WebSocket) and sends each ~2 s
+   slice as an uncompressed WAV (16k mono) binary message; `"done"` closes the
+   audio side.
+3. Poll `GET /streams/{id}`: while recording it returns
+   `{ "status": "active", "partial_text": "...", "audio_seconds": N }`. The
+   partial is the **whole buffer re-transcribed as soon as ~2 s of new audio
+   arrives** ("draft que refina"), never an append, so earlier words may change
+   — that's expected. Chunks quieter than `STREAM_RMS_FLOOR` skip the partial to
+   avoid Whisper hallucinating on pauses.
+4. `POST /streams/{id}` finalizes: the full buffer runs the normal Whisper +
+   LLM pipeline. Polling `GET /streams/{id}` then returns the standard
+   `job`-shape response (`processing` → `completed`/`failed`).
+
+Whisper runs a shared non-thread-safe context, so every model call — streaming
+partials, finals, and whole-record `/jobs` — serializes through one lock. The LLM
+analysis deliberately runs *outside* that lock, so one session's language-model
+step never blocks another session's live draft. If the WebSocket fails to open,
+the UI transparently falls back to the classic stop-and-upload `/jobs` flow.
+
 ## Configuration (env vars)
 
 See `backend/.env.example`:
@@ -145,6 +169,10 @@ See `backend/.env.example`:
 | `OLLAMA_URL` | `http://localhost:11434` | LLM API base URL |
 | `LLM_MODEL` | `llama3.1:8b` | Model served by Ollama (`llama3.1:8b` chosen by benchmark; see **Model tuning**) |
 | `LLM_TEMPERATURE` | `0.1` | Sampling temperature for extraction |
+| `STREAM_RETENTION_SECS` | `600` | How long a stream session is kept before sweep |
+| `STREAM_MAX_SECS` | `600` | Hard cap on recorded audio per session |
+| `STREAM_PARTIAL_INTERVAL_SECS` | `2` | New audio (s) that triggers a refining partial transcribe |
+| `STREAM_RMS_FLOOR` | `0.002` | Chunk RMS below which a partial is skipped (silence guard) |
 
 Model trade-offs (all from
 [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)):

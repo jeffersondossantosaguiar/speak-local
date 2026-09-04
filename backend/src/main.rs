@@ -3,12 +3,16 @@ use axum::routing::{get, post};
 use axum::Router;
 use speak_local_backend::config::Config;
 use std::path::Path;
-use speak_local_backend::handlers::{get_job, health, submit_job};
-use speak_local_backend::jobs::JobStore;
+use speak_local_backend::handlers::{
+    create_stream, finalize_stream, get_job, get_stream, health, stream_ws, submit_job, AppState,
+};
+use speak_local_backend::jobs::{JobStore, WhisperGate};
 use speak_local_backend::providers::ollama::OllamaProvider;
 use speak_local_backend::providers::whisper::WhisperProvider;
+use speak_local_backend::streams::StreamStore;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prefer the .env next to the crate so `cargo run` works from the workspace
@@ -50,15 +54,37 @@ async fn run_server(
     transcription: Arc<dyn speak_local_backend::providers::TranscriptionProvider>,
     analysis: Arc<dyn speak_local_backend::providers::AnalysisProvider>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let job_store = Arc::new(JobStore::new(transcription, analysis, &cfg));
+    // One whisper gate serializes ALL model access: whole-record jobs and
+    // streaming partial/final passes share a single non-thread-safe context.
+    let whisper_gate: WhisperGate = Arc::new(Mutex::new(()));
+    let job_store = Arc::new(JobStore::with_gate(
+        transcription.clone(),
+        analysis.clone(),
+        &cfg,
+        whisper_gate.clone(),
+    ));
+    let stream_store = Arc::new(StreamStore::new(
+        transcription,
+        analysis,
+        whisper_gate,
+        &cfg,
+    ));
+    let state = AppState {
+        jobs: job_store.clone(),
+        streams: stream_store.clone(),
+    };
 
-    // Periodically sweep finished jobs so the in-memory map stays bounded.
+    // Periodically sweep finished jobs and stream sessions so the in-memory
+    // maps stay bounded.
     {
         let store = job_store.clone();
+        let streams = stream_store.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                store.sweep(std::time::SystemTime::now());
+                let now = std::time::SystemTime::now();
+                store.sweep(now);
+                streams.sweep(now);
             }
         });
     }
@@ -73,7 +99,10 @@ async fn run_server(
             post(submit_job).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
         )
         .route("/jobs/{id}", get(get_job))
-        .with_state(job_store);
+        .route("/streams", post(create_stream))
+        .route("/streams/{id}", get(get_stream).post(finalize_stream))
+        .route("/streams/{id}/ws", get(stream_ws))
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("listening on http://{}", cfg.bind_addr);

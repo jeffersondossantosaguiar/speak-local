@@ -21,6 +21,15 @@ pub struct Config {
     pub llm_model: String,
     /// LLM temperature for structured extraction.
     pub llm_temperature: f32,
+    /// How long a streaming session is kept before it is swept (seconds).
+    pub stream_retention_secs: u64,
+    /// Hard cap on recorded audio per session (seconds).
+    pub stream_max_secs: usize,
+    /// How much new audio triggers a refining partial transcribe (seconds).
+    pub stream_partial_interval_secs: usize,
+    /// RMS floor below which a chunk is treated as silence and does not trigger
+    /// a partial. Keeps Whisper from hallucinating on quiet pauses.
+    pub stream_rms_floor: f32,
 }
 
 impl Config {
@@ -53,6 +62,22 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0.1),
+            stream_retention_secs: std::env::var("STREAM_RETENTION_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+            stream_max_secs: std::env::var("STREAM_MAX_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
+            stream_partial_interval_secs: std::env::var("STREAM_PARTIAL_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2),
+            stream_rms_floor: std::env::var("STREAM_RMS_FLOOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.002),
         })
     }
 }

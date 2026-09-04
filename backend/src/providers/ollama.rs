@@ -118,7 +118,13 @@ impl OllamaProvider {
             url: format!("{}/v1/chat/completions", cfg.ollama_url.trim_end_matches('/')),
             model: cfg.llm_model.clone(),
             temperature: cfg.llm_temperature,
-            client: reqwest::blocking::Client::new(),
+            // reqwest's blocking client defaults to a 30 s total timeout, but a
+            // full grammar analysis on llama3.1:8b routinely takes 60–90 s on
+            // this hardware, so raise it well past the longest practical run.
+            client: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .expect("blocking reqwest client builds"),
         }
     }
 

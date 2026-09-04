@@ -110,6 +110,12 @@ button:disabled {
   color: #e6e6e6;
 }
 
+.transcript.draft {
+  border-style: dashed;
+  border-color: #4a4a55;
+  color: #cfcfcf;
+}
+
 .no-errors {
   color: #2ecc71;
 }
