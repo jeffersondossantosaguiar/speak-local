@@ -1,0 +1,18 @@
+# Rust
+/target
+
+# Node / pnpm
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Local env
+.env
+backend/.env
+
+# Whisper model binaries — downloaded, never committed (keep .gitkeep)
+backend/models/*.bin
+
+# Editor
+.DS_Store
+*.swp

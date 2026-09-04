@@ -1,0 +1,10 @@
+{
+  "name": "speak-local",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "pnpm --filter frontend dev",
+    "build": "pnpm --filter frontend build",
+    "typecheck": "pnpm --filter frontend typecheck"
+  }
+}

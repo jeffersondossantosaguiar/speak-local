@@ -1,0 +1,153 @@
+:root {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+  color: #e6e6e6;
+  background: #17171b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+h1 {
+  margin-bottom: 0.25rem;
+}
+
+.subtitle {
+  color: #9a9aa5;
+  margin-top: 0;
+}
+
+.recorder {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  border: 1px solid #2c2c33;
+  border-radius: 8px;
+  background: #1e1e24;
+}
+
+.rec-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ff4d4d;
+  animation: pulse 1s infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+button {
+  font: inherit;
+  padding: 0.55rem 1rem;
+  border: none;
+  border-radius: 6px;
+  background: #4a7fff;
+  color: #fff;
+  cursor: pointer;
+}
+
+button:disabled {
+  background: #333340;
+  cursor: not-allowed;
+}
+
+.status {
+  color: #9a9aa5;
+  font-style: italic;
+}
+
+.error {
+  color: #ff6b6b;
+}
+
+.results {
+  margin-top: 2rem;
+}
+
+.cefr {
+  border: 1px solid #2c2c33;
+  border-radius: 8px;
+  padding: 1rem;
+  background: #1e1e24;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.cefr strong {
+  font-size: 1.4rem;
+  color: #ffd166;
+}
+
+.no-errors {
+  color: #2ecc71;
+}
+
+.errors {
+  list-style: none;
+  padding: 0;
+}
+
+.error-item {
+  border: 1px solid #2c2c33;
+  border-left: 4px solid #4a7fff;
+  border-radius: 8px;
+  padding: 0.9rem 1rem;
+  margin-bottom: 0.75rem;
+  background: #1e1e24;
+}
+
+.error-item.cat-grammar {
+  border-left-color: #ff6b6b;
+}
+.error-item.cat-vocabulary {
+  border-left-color: #ffd166;
+}
+.error-item.cat-pronunciation {
+  border-left-color: #6bc5ff;
+}
+.error-item.cat-awkward {
+  border-left-color: #b36bff;
+}
+
+.error-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  color: #9a9aa5;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 0.4rem;
+}
+
+.context {
+  font-style: italic;
+  color: #c9c9d4;
+  margin: 0.3rem 0;
+}
+
+.explanation {
+  color: #9a9aa5;
+  margin: 0.4rem 0 0;
+}
