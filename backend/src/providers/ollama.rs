@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::error::AppError;
-use crate::providers::{Analysis, AnalysisProvider, AnalysisResult, ErrorItem};
+use crate::providers::{Analysis, AnalysisProvider, AnalysisResult, ErrorItem, strip_markers};
 use serde::{Deserialize, Serialize};
 
 /// Local LLM analysis via Ollama's OpenAI-compatible chat endpoint.
@@ -98,6 +98,11 @@ Your job: report ONLY genuine grammatical and vocabulary errors — the kind a p
 - Never flag product names or technical terms as vocabulary errors. If a term in the transcript looks misspelled or invented, flag it at most once with criticality 1-2 as category "other" and note it may be a transcription artifact.
 - Never invent errors or quote words that do not appear in the transcript.
 
+Low-confidence spans: some words are wrapped in guillemets, e.g. «NestJS» or «Louisa Labs». Those come from the transcriber, not the speaker: it was unsure what was actually said (typically product names, people names, or specialized jargon). Treat them as PROBABLE transcription artifacts:
+- Never build a grammar error, a full-sentence correction, or a rewrite around a marked span.
+- If a marked span forms no coherent, plausible phrase, omit it entirely or, at most, report it once as category "other" with criticality 1-2.
+- An unmarked word next to a marked span that is genuinely wrong in itself can still be reported normally.
+
 Real errors to catch — criticality 4-5 when they blur meaning:
 - wrong verb tense/form or subject-verb agreement
 - missing or wrong articles or prepositions
@@ -111,7 +116,7 @@ For each error include:
    - "category": one of "grammar", "vocabulary", "pronunciation", "awkward", "other"
    - "criticality": 1-5 (1-2 for minor nits, 4-5 for meaning-breaking errors)
    - "context": the sentence the error appears in (quote it roughly as spoken)
-   - "explanation": a short plain-English reason, written to help them learn
+   - "explanation": a short plain-English reason, written to help them learn. It must describe the defect that genuinely exists in the original "text" AND be fixed by applying "suggestion". Before returning each item, re-check the explanation against the correction: if the explanation claims a change the correction does not actually make (e.g. the suggestion stays in the same tense or the same word order), adjust it until they agree.
 
 Then estimate a rough CEFR level (A1, A2, B1, B2, C1, or C2) and justify it in one sentence ("cefr_justification").
 
@@ -422,16 +427,18 @@ fn parse_analysis(content: &str) -> Result<Analysis, AppError> {
 
 fn map_error_json(e: ErrorJson) -> ErrorItem {
     ErrorItem {
-        text: e.text.trim().to_string(),
-        suggestion: e.suggestion.trim().to_string(),
+        // The model may quote marked spans back to us; drop the «…» so no
+        // transcription marker leaks into the UI.
+        text: strip_markers(&e.text).trim().to_string(),
+        suggestion: strip_markers(&e.suggestion).trim().to_string(),
         category: if e.category.is_empty() {
             "other".to_string()
         } else {
             e.category
         },
         criticality: e.criticality,
-        context: e.context.trim().to_string(),
-        explanation: e.explanation.trim().to_string(),
+        context: strip_markers(&e.context).trim().to_string(),
+        explanation: strip_markers(&e.explanation).trim().to_string(),
     }
 }
 
@@ -511,5 +518,22 @@ mod tests {
         let out = filter_style_false_positives(input);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].criticality, 2);
+    }
+
+    #[test]
+    fn strips_confidence_markers_from_model_output() {
+        let e = ErrorJson {
+            text: "I use «NAS.js» for it".into(),
+            suggestion: "I use NestJS for it".into(),
+            category: "other".into(),
+            criticality: 2,
+            context: "«NAS.js» is the new API".into(),
+            explanation: "looks like a transcription artifact".into(),
+        };
+        let mapped = map_error_json(e);
+        assert_eq!(mapped.text, "I use NAS.js for it");
+        assert_eq!(mapped.suggestion, "I use NestJS for it");
+        assert_eq!(mapped.context, "NAS.js is the new API");
+        assert_eq!(mapped.explanation, "looks like a transcription artifact");
     }
 }

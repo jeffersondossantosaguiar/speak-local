@@ -15,6 +15,7 @@ impl TranscriptionProvider for StubTranscriber {
     fn transcribe(&self, _samples: &AudioSamples) -> speak_local_backend::providers::TranscriptionResult {
         Ok(Transcript {
             text: "hello world".into(),
+            ..Default::default()
         })
     }
 }

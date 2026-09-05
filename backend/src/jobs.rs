@@ -233,7 +233,7 @@ async fn run_job(
         transcript: transcript.clone(),
     });
 
-    let text = transcript.text.clone();
+    let text = transcript.analysis_text();
     let hub2 = hub.clone();
     let analysis = tokio::task::spawn_blocking(move || {
         analysis.analyze_streaming(&text, &mut |delta: &str| {

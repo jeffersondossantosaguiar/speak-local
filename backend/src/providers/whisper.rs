@@ -10,6 +10,8 @@ pub struct WhisperProvider {
     ctx: WhisperContext,
     n_threads: usize,
     initial_prompt: String,
+    /// Tokens with `token_probability < threshold` are low-confidence.
+    low_conf_threshold: f32,
 }
 
 impl WhisperProvider {
@@ -33,7 +35,8 @@ impl WhisperProvider {
         Ok(Self {
             ctx,
             n_threads,
-            initial_prompt: cfg.whisper_initial_prompt.clone(),
+            initial_prompt: cfg.effective_whisper_prompt(),
+            low_conf_threshold: cfg.whisper_low_conf_threshold,
         })
     }
 }
@@ -61,17 +64,62 @@ impl TranscriptionProvider for WhisperProvider {
             .map_err(|e| AppError::Transcription(format!("inference failed: {e}")))?;
 
         let n_segments = state.full_n_segments();
-        let mut parts = Vec::new();
+
+        // Assemble the standard segment text while recording byte ranges of
+        // tokens whisper was unsure about. Special tokens (e.g. "[_BEG_]",
+        // "<|endoftext|>") are decoded as text starting with "[" or "<|", so
+        // they are skipped rather than joined into the transcript.
+        let mut text = String::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut in_span = false;
+        let mut span_start = 0;
         for i in 0..n_segments {
-            if let Some(seg) = state.get_segment(i) {
-                let text = seg.to_string().trim().to_string();
-                if !text.is_empty() {
-                    parts.push(text);
+            let Some(seg) = state.get_segment(i) else {
+                continue;
+            };
+            for t in 0..seg.n_tokens() {
+                let Some(tok) = seg.get_token(t) else {
+                    continue;
+                };
+                let Ok(raw) = tok.to_str() else {
+                    continue;
+                };
+                let piece = raw.trim_start();
+                if piece.is_empty() || piece.starts_with('[') || piece.contains("<|") {
+                    continue;
                 }
+                let had_leading_space = piece.len() < raw.len();
+                let low = tok.token_probability() < self.low_conf_threshold;
+
+                if low {
+                    if !in_span {
+                        if had_leading_space && !text.ends_with(' ') {
+                            text.push(' ');
+                        }
+                        span_start = text.len();
+                        in_span = true;
+                    } else if had_leading_space && !text.ends_with(' ') {
+                        text.push(' ');
+                    }
+                } else {
+                    if in_span {
+                        spans.push((span_start, text.len()));
+                        in_span = false;
+                    }
+                    if had_leading_space && !text.ends_with(' ') {
+                        text.push(' ');
+                    }
+                }
+                text.push_str(piece);
             }
         }
-
-        let text = parts.join(" ").trim().to_string();
-        Ok(Transcript { text })
+        if in_span {
+            spans.push((span_start, text.len()));
+        }
+        let text = text.trim().to_string();
+        Ok(Transcript {
+            text,
+            low_confidence_spans: spans,
+        })
     }
 }

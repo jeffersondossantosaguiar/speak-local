@@ -165,7 +165,9 @@ See `backend/.env.example`:
 | `BIND_ADDR` | `127.0.0.1:8787` | Backend listen address |
 | `WHISPER_MODEL` | `models/ggml-small.en.bin` | Whisper model path (relative paths resolve against `backend/`) |
 | `WHISPER_USE_GPU` | `0` | Run Whisper on the GPU (requires a `--features cuda` build; the repo's `.env` sets `1`) |
-| `WHISPER_INITIAL_PROMPT` | built-in tech-term seed | Seed vocabulary to bias the decoder (helps "NestJS" survive ASR) |
+| `WHISPER_INITIAL_PROMPT` | generic software-eng vocab seed | Seed vocabulary to bias the decoder (overrides the built-in base list entirely) |
+| `WHISPER_VOCAB_HINTS` | *(none)* | Extra terms appended to the Whisper seed — the hook for your own product/company names without touching code |
+| `WHISPER_LOW_CONF_THRESHOLD` | `0.6` | Min per-token confidence; lower tokens are flagged `«…»` in the analysis and treated as likely transcription artifacts |
 | `OLLAMA_URL` | `http://localhost:11434` | LLM API base URL |
 | `LLM_MODEL` | `llama3.1:8b` | Model served by Ollama (`llama3.1:8b` chosen by benchmark; see **Model tuning**) |
 | `LLM_TEMPERATURE` | `0.1` | Sampling temperature for extraction |
@@ -215,6 +217,21 @@ Backed by a measured tuning pass (this machine: Ryzen 5 1600, 16 GB RAM, GTX 165
   mis-heard tech terms that are in the seed (e.g. "NestJS"), but it cannot recover
   a term transcriber mishears as a different known word. For real accuracy on
   proper nouns, re-record or correct the transcript.
+- The base seed is **deliberately generic** (APIs, microservices, SQL/NoSQL,
+  cloud, Docker, Kubernetes, common frameworks, …) so it stays useful for anyone.
+  Add your own brand/product names with `WHISPER_VOCAB_HINTS` — it is always
+  appended to the base, e.g.:
+  ```
+  WHISPER_VOCAB_HINTS=LuizaLabs, LIGA FACENS, LinkApi, BuildOne, Wellhub
+  ```
+- Since Whisper is often confidently wrong about domain terms, the backend also
+  records per-token confidence and feeds the analysis a copy of the transcript
+  where doubtful spans are wrapped in `«…»`. The model is instructed to treat
+  those as probable transcription artifacts: it won't build a grammar rewrite
+  around them or present garbled text as a speaker error. That's why a few `«…»`
+  phrases can appear in the analysis prompt while the transcript you see stays
+  clean — and why a flagged low-confidence span may be downgraded or omitted.
+  Tune sensitivity with `WHISPER_LOW_CONF_THRESHOLD`.
 
 The analysis prompt (`ollama.rs`) is tuned to report only real grammar/vocabulary
 errors, to treat likely transcription artifacts (odd tech terms) cautiously, and
